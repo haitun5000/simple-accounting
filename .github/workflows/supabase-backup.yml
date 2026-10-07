@@ -53,8 +53,10 @@ jobs:
     steps:
       - name: Ping Supabase REST API
         run: |
+          # 查询真实数据表触发数据库活动（根端点已收紧为 service_role 专用，不能用 anon key）
+          # 匿名查询返回空数组也算成功：SQL 已执行，7 天计时已重置
           code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 \
-            "$SUPABASE_URL/rest/v1/" -H "apikey: $SUPABASE_ANON_KEY")
+            "$SUPABASE_URL/rest/v1/records?select=*&limit=1" -H "apikey: $SUPABASE_ANON_KEY")
           echo "REST API 返回 HTTP $code"
           if [ "$code" = "200" ]; then
             echo "✅ 保活成功：项目在线，7 天不活跃计时已重置"
