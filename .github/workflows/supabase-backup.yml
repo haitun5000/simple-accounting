@@ -1,0 +1,142 @@
+# ============================================================
+# Supabase 保活 + 自动备份
+#
+# 作用：
+#   1. 保活：每天自动查询一次 Supabase REST API，重置"7 天不活跃"计时，
+#      防止免费版项目被自动暂停（项目暂停后 App 无法同步数据）
+#   2. 备份：每天导出数据库 public schema（表结构 + 数据）到仓库 backup/ 目录，
+#      同时上传一份 artifact（保留 90 天）
+#
+# 需要在仓库 Settings → Secrets and variables → Actions 配置 4 个 secret：
+#   SUPABASE_URL       项目地址，如 https://xxxx.supabase.co
+#                      （Dashboard → Project Settings → API → Project URL）
+#   SUPABASE_ANON_KEY  anon public key（同一页面），保活用
+#   SUPABASE_DB_URL    Session Pooler 连接串（备份用），见 Dashboard → Connect
+#                      → Session pooler（端口 5432），把 [YOUR-PASSWORD] 换成
+#                      数据库密码。注意不能用 Transaction pooler（6543 端口）
+#   BACKUP_PASSWORD    （可选，强烈建议）备份文件加密密码。
+#                      公开仓库必须配置，否则记账数据会公开可见
+#
+# 恢复数据（需要时）：
+#   解密：openssl enc -d -aes-256-cbc -pbkdf2 -in 备份文件.dump.enc -out 备份文件.dump -pass pass:你的密码
+#   恢复：docker run --rm -v "$PWD:/work" postgres:17 \
+#           pg_restore --dbname="新的连接串" --clean --if-exists /work/备份文件.dump
+# ============================================================
+
+name: Supabase 保活与自动备份
+
+on:
+  schedule:
+    # 每天 UTC 20:20（北京时间凌晨 04:20）自动运行，错开整点高峰延迟更小
+    - cron: '20 20 * * *'
+  # 支持在 Actions 页面手动触发（配置好 secrets 后先手动跑一次验证）
+  workflow_dispatch: {}
+
+# 允许把备份文件提交回仓库
+permissions:
+  contents: write
+
+# 同一时间只允许一个实例运行
+concurrency:
+  group: supabase-keepalive-backup
+  cancel-in-progress: false
+
+jobs:
+  # ---------- 保活 ----------
+  keepalive:
+    name: 保活（防止项目被暂停）
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+    steps:
+      - name: Ping Supabase REST API
+        run: |
+          code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 \
+            "$SUPABASE_URL/rest/v1/" -H "apikey: $SUPABASE_ANON_KEY")
+          echo "REST API 返回 HTTP $code"
+          if [ "$code" = "200" ]; then
+            echo "✅ 保活成功：项目在线，7 天不活跃计时已重置"
+          else
+            echo "::error::保活失败（HTTP $code）。若连续失败，项目可能已被暂停，请到 Supabase Dashboard 手动点击 Restore 恢复（数据不会丢）。"
+            exit 1
+          fi
+
+  # ---------- 备份 ----------
+  backup:
+    name: 备份数据库
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+      BACKUP_PASSWORD: ${{ secrets.BACKUP_PASSWORD }}
+      KEEP_COUNT: "30"   # 仓库中保留最近 30 份备份，超出自动清理
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 生成备份时间戳
+        id: vars
+        run: echo "stamp=$(date -u +%Y%m%d-%H%M)" >> "$GITHUB_OUTPUT"
+
+      - name: 导出 public schema（表结构 + 数据）
+        run: |
+          mkdir -p backup
+          FILE="backup/supabase-${{ steps.vars.outputs.stamp }}.dump"
+          # 用 postgres:17-alpine 官方镜像执行 pg_dump，客户端版本始终 >= 服务端
+          # 必须用 Session Pooler 连接串（5432 端口），--schema=public 排除无权限的系统 schema
+          docker run --rm -v "$PWD:/work" postgres:17-alpine \
+            pg_dump --dbname="$SUPABASE_DB_URL" \
+              --format=custom --schema=public \
+              --no-owner --no-privileges \
+              --file="/work/$FILE"
+          echo "已导出：$FILE"
+
+      - name: 校验备份文件完整可读
+        run: |
+          FILE="backup/supabase-${{ steps.vars.outputs.stamp }}.dump"
+          test -s "$FILE" || { echo "::error::备份文件为空，导出失败"; exit 1; }
+          docker run --rm -v "$PWD:/work" postgres:17-alpine \
+            pg_restore --list "/work/$FILE" > /dev/null
+          du -h "$FILE"
+          echo "✅ 备份文件校验通过"
+
+      - name: 可选加密（配置了 BACKUP_PASSWORD 才生效）
+        run: |
+          FILE="backup/supabase-${{ steps.vars.outputs.stamp }}.dump"
+          if [ -n "$BACKUP_PASSWORD" ]; then
+            openssl enc -aes-256-cbc -pbkdf2 -salt \
+              -in "$FILE" -out "$FILE.enc" -pass env:BACKUP_PASSWORD
+            rm "$FILE"
+            echo "已加密：$FILE.enc"
+          else
+            echo "::warning::未配置 BACKUP_PASSWORD，本次为明文备份。公开仓库请务必配置加密密码！"
+          fi
+
+      - name: 清理旧备份（只保留最近 30 份）
+        run: |
+          cd backup || exit 0
+          ls -t supabase-*.dump* 2>/dev/null | tail -n +$((KEEP_COUNT + 1)) | xargs -r rm --
+          echo "当前保留的备份："
+          ls -t supabase-*.dump* 2>/dev/null | head -5
+
+      - name: 上传 artifact 副本（保留 90 天）
+        uses: actions/upload-artifact@v4
+        with:
+          name: supabase-backup-${{ steps.vars.outputs.stamp }}
+          path: backup/supabase-${{ steps.vars.outputs.stamp }}.dump*
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: 提交备份到仓库
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add backup/
+          if git diff --cached --quiet; then
+            echo "无新增备份，跳过提交"
+          else
+            git commit -m "备份: Supabase 自动备份 ${{ steps.vars.outputs.stamp }}"
+            git push
+          fi
